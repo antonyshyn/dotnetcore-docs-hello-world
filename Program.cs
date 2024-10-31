@@ -1,13 +1,18 @@
-// Program.cs
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
+// Add JSON request model
+record ImageUploadRequest(string Photo);
+
+// In-memory storage for the latest image and connected clients
 string latestImageData = string.Empty;
 List<WebSocket> connectedClients = new();
 
+// WebSocket endpoint
 app.UseWebSockets();
 app.Map("/ws", async context =>
 {
@@ -16,6 +21,7 @@ app.Map("/ws", async context =>
         using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
         connectedClients.Add(webSocket);
 
+        // Send the latest image immediately after connection
         if (!string.IsNullOrEmpty(latestImageData))
         {
             await webSocket.SendAsync(
@@ -25,6 +31,7 @@ app.Map("/ws", async context =>
                 CancellationToken.None);
         }
 
+        // Keep the connection alive and handle disconnection
         try
         {
             var buffer = new byte[1024 * 4];
@@ -50,39 +57,63 @@ app.Map("/ws", async context =>
 
 app.MapPost("/api/image", async (HttpContext context) =>
 {
-    using var reader = new StreamReader(context.Request.Body);
-    latestImageData = await reader.ReadToEndAsync();
-
-    var deadSockets = new List<WebSocket>();
-    foreach (var socket in connectedClients)
+    try
     {
-        try
-        {
-            if (socket.State == WebSocketState.Open)
+        var request = await JsonSerializer.DeserializeAsync<ImageUploadRequest>(
+            context.Request.Body,
+            new JsonSerializerOptions
             {
-                await socket.SendAsync(
-                    Encoding.UTF8.GetBytes(latestImageData),
-                    WebSocketMessageType.Text,
-                    true,
-                    CancellationToken.None);
+                PropertyNameCaseInsensitive = true
+            });
+
+        if (request == null || string.IsNullOrEmpty(request.Photo))
+        {
+            return Results.BadRequest("Missing or invalid 'photo' field");
+        }
+
+        latestImageData = request.Photo.StartsWith("data:image")
+            ? request.Photo
+            : $"data:image/jpeg;base64,{request.Photo}";
+
+        var deadSockets = new List<WebSocket>();
+        foreach (var socket in connectedClients)
+        {
+            try
+            {
+                if (socket.State == WebSocketState.Open)
+                {
+                    await socket.SendAsync(
+                        Encoding.UTF8.GetBytes(latestImageData),
+                        WebSocketMessageType.Text,
+                        true,
+                        CancellationToken.None);
+                }
+                else
+                {
+                    deadSockets.Add(socket);
+                }
             }
-            else
+            catch
             {
                 deadSockets.Add(socket);
             }
         }
-        catch
+
+        foreach (var socket in deadSockets)
         {
-            deadSockets.Add(socket);
+            connectedClients.Remove(socket);
         }
-    }
 
-    foreach (var socket in deadSockets)
+        return Results.Ok(new { message = "Image received and broadcast successfully" });
+    }
+    catch (JsonException)
     {
-        connectedClients.Remove(socket);
+        return Results.BadRequest("Invalid JSON format");
     }
-
-    return Results.Ok();
+    catch (Exception ex)
+    {
+        return Results.StatusCode(500); // Internal Server Error
+    }
 });
 
 app.MapGet("/", () => Results.Content("""
